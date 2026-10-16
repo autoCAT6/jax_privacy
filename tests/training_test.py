@@ -344,6 +344,116 @@ class DPTrainerTest(parameterized.TestCase):
       )
       self.assertEqual(final_state_resumed.step, expected_final_state.step)
 
+  @parameterized.named_parameters(*_DATASET_TYPES)
+  def test_compress_and_restore_replays_identically(self, to_dataset):
+    """compress + restore replays identically across intermediate steps."""
+    params = {'w': jnp.array([5.0, 5.0], dtype=jnp.bfloat16), 'b': jnp.zeros(1)}
+    dataset = to_dataset(
+        np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+    )
+    config = execution_plan.BandMFConfig.default(
+        num_bands=3,
+        iterations=5,
+        noise_multiplier=0.5,
+        expected_participations=1,
+    )
+
+    def loss_fn(p, x, rng):
+      del rng
+      pred = p['w'].astype(jnp.float32) - x + p['b']
+      loss = jnp.mean(pred**2)
+      return loss, {'loss': loss}
+
+    make_trainer = lambda: training.DPTrainer(
+        config=config, loss_fn=loss_fn, optimizer=optax.sgd(0.01), noise_seed=7
+    )
+    intermediate_states = []
+    callback = lambda _, s, __: intermediate_states.append(
+        jax.tree.map(jnp.copy, s)
+    )
+
+    trainer = make_trainer()
+    expected = trainer.fit(
+        dataset, trainer.init(params), rng_or_seed=42, callback=callback
+    )
+
+    for state in intermediate_states[:-1]:
+      ckpt_state = state.compress()
+      self.assertIsNone(ckpt_state.noise_state)
+      fresh_trainer = make_trainer()
+      resumed = fresh_trainer.fit(
+          dataset, ckpt_state.restore(fresh_trainer), rng_or_seed=42
+      )
+      assert_close = lambda a, b: np.testing.assert_allclose(
+          a, b, atol=1e-6, rtol=1e-6
+      )
+      jax.tree.map(assert_close, resumed.params, expected.params)
+      self.assertEqual(int(resumed.step), int(expected.step))
+
+  def test_compress_and_restore_thousands_of_iterations(self):
+    """Replay matches sequential train_step over 2500 steps."""
+    num_steps = 2500
+    params = {'w0': jnp.zeros(5, jnp.bfloat16), 'w1': jnp.zeros(5, jnp.float32)}
+    config = execution_plan.BandMFConfig.default(
+        num_bands=16,
+        iterations=num_steps,
+        noise_multiplier=0.5,
+        expected_participations=1,
+        strategy_optimization_steps=25,
+    )
+
+    def loss_fn(p, x, _):
+      losses = [jnp.mean((v.astype(jnp.float32) - x) ** 2) for v in p.values()]
+      return sum(losses), {}
+
+    make_trainer = lambda: training.DPTrainer(
+        config=config, loss_fn=loss_fn, optimizer=optax.sgd(0.001), noise_seed=3
+    )
+    trainer = make_trainer()
+    fresh_trainer = make_trainer()
+    training._replay_noise_state.clear_cache()
+
+    state = trainer.init(params)
+    batch = jnp.ones((2, 5), dtype=jnp.float32)
+    is_pad = jnp.zeros((2,), dtype=jnp.bool_)
+    prng = jax.random.key(7)
+
+    for step in range(num_steps + 1):
+      if step in {0, 1, 17, 500, 1500, num_steps}:
+        state_copy = jax.tree.map(jnp.copy, state)
+        restored = state_copy.compress().restore(fresh_trainer)
+        key_new, buf_new = restored.noise_state
+        key_ref, buf_ref = state_copy.noise_state
+        self.assertTrue(bool(jnp.array_equal(key_new, key_ref)))
+        jax.tree.map(
+            lambda a, b: np.testing.assert_allclose(a, b, atol=1e-5, rtol=1e-5),
+            buf_new,
+            buf_ref,
+        )
+      if step < num_steps:
+        state, _ = trainer.train_step(state, batch, is_pad, prng)
+
+    self.assertEqual(training._replay_noise_state._cache_size(), 1)
+
+  def test_compress_and_restore_validation(self):
+    """Tests noise_seed validation, unrestored fit error, and idempotence."""
+    params = jnp.array([5.0, 5.0])
+    dataset = np.array([[1.0, 2.0], [3.0, 4.0]])
+    seedless = training.DPTrainer(
+        config=_make_config(3),
+        loss_fn=_quadratic_loss,
+        optimizer=optax.sgd(1.0),
+    )
+    state0 = seedless.init(params)
+    compressed = state0.compress()
+    self.assertIsNone(compressed.noise_state)
+    with self.assertRaisesRegex(ValueError, 'noise_seed'):
+      compressed.restore(seedless)
+    with self.assertRaisesRegex(ValueError, 'Compressed state'):
+      seedless.fit(dataset, compressed, rng_or_seed=0)
+    assert_eq = lambda a, b: self.assertTrue(bool(jnp.array_equal(a, b)))
+    jax.tree.map(assert_eq, state0.restore(seedless), state0)
+
   def test_map_dataset_pytree_structure(self):
     """Train loop works with a Grain MapDataset yielding PyTrees."""
     params = jnp.array([1.0, 2.0])

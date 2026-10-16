@@ -123,6 +123,15 @@ class LossFn(Protocol):
     ...
 
 
+@jax.jit(static_argnames=["transform", "dtype"])
+def _replay_noise_state(transform, params, dtype, step):
+  """Replays a noise-addition transform from step 0 to ``step``."""
+  grads_like = optax.tree.cast(params, dtype)
+  zeros = optax.tree.zeros_like(grads_like)
+  body = lambda _, s: transform.update(zeros, s)[1]
+  return jax.lax.fori_loop(0, step, body, transform.init(grads_like))
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class TrainingState:
@@ -131,7 +140,36 @@ class TrainingState:
   step: int
   params: Params
   opt_state: OptState
-  noise_state: NoiseState
+  noise_state: NoiseState | None = None
+
+  def compress(self) -> "TrainingState":
+    """Returns a copy with ``noise_state`` set to ``None`` for checkpointing."""
+    return dataclasses.replace(self, noise_state=None)
+
+  def restore(self, trainer: "DPTrainer") -> "TrainingState":
+    """Reconstructs ``noise_state`` via replay when ``noise_state`` is ``None``.
+
+    Replays ``trainer``'s noise-addition transformation from step 0 to
+    ``self.step`` (requiring ``trainer.noise_seed`` to be set). States whose
+    ``noise_state`` is already populated are returned unchanged.
+
+    Args:
+      trainer: :class:`~jax_privacy.training.DPTrainer` with ``noise_seed`` set.
+
+    Returns:
+      A :class:`~jax_privacy.training.TrainingState` ready for
+      :meth:`~jax_privacy.training.DPTrainer.fit`.
+    """
+    if self.noise_state is not None:
+      return self
+    if trainer.noise_seed is None:
+      raise ValueError("TrainingState.restore requires DPTrainer.noise_seed.")
+    dtype = jax.numpy.dtype(trainer.performance_flags.dtype)
+    step = jax.numpy.asarray(self.step, jax.numpy.int32)
+    noise_state = _replay_noise_state(
+        trainer.plan.noise_addition_transform, self.params, dtype, step
+    )
+    return dataclasses.replace(self, noise_state=noise_state)
 
 
 CallbackFn: TypeAlias = Callable[[int, TrainingState, PerExampleAux], None]
@@ -249,6 +287,8 @@ class DPTrainer:
       A tuple ``(new_state, aux)`` where ``new_state`` is the updated
       ``TrainingState`` and ``aux`` is the per-example auxiliary output.
     """
+    if state.noise_state is None:
+      raise ValueError("Compressed state; call state.restore(trainer) first.")
     optimizer = aug_optimizers.as_augmented_optimizer(self.optimizer)
     pre_clip_fn = optimizer.pre_clipping_transform(state.opt_state)
     grad_fn = self.plan.clipped_grad(
